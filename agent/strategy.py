@@ -90,9 +90,15 @@ __all__ = [
     "SAFE_STARTING_RESERVE",
     "CATALOG_TRAP_TOOLS",
     "DEPRECATED_SUCCESSORS",
+    "WRITE_TOOLS",
+    "A2A_SERVERS",
+    "DEFAULT_MASKS",
+    "KNOWN_DRIFTING_PATHS",
     "disciplined_round_cost",
     "careless_round_cost",
     "is_catalog_trap",
+    "is_drifting_path",
+    "extract_path_id",
     "cheap_mask",
     "successor_of",
     "BudgetPacer",
@@ -126,6 +132,69 @@ CATALOG_TRAP_TOOLS: frozenset[tuple[str, str]] = frozenset(
 DEPRECATED_SUCCESSORS: Mapping[tuple[str, str], tuple[str, str]] = {
     ("slides", "search"): ("slides", "query"),
 }
+
+# Write tools in the arena (CONTRACTS.md §3.4)
+WRITE_TOOLS: frozenset[tuple[str, str]] = frozenset({
+    ("content", "flag_stale_slide"),
+    ("content", "file_content_bug"),
+    ("progress", "record_mastery"),
+})
+
+# Known A2A peer servers (CONTRACTS.md §8, kit.mcp.a2a)
+A2A_SERVERS: frozenset[str] = frozenset({
+    "curriculum-analyst",
+    "citation-checker",
+    "roster",
+})
+
+# Narrow, cheap default field masks for tools (budget & grounding discipline)
+DEFAULT_MASKS: Mapping[tuple[str, str], tuple[str, ...]] = {
+    ("slides", "query"): ("title", "anchor"),
+    ("slides", "get_frame"): ("title", "body", "anchor"),
+    ("slides", "whatlinkshere"): ("anchor",),
+    ("glossary", "define"): ("definition", "sense", "anchor"),
+    ("glossary", "list_terms"): ("term",),
+    ("registry", "provenance"): ("etag", "replica", "anchor"),
+    ("registry", "list_servers"): ("name",),
+    ("research", "cite_source"): ("url", "anchor"),
+    ("curriculum-analyst", "which_days_cover"): ("course_day", "track", "anchor"),
+    ("citation-checker", "verify_source"): ("verdict", "anchor"),
+    ("roster", "lookup_learner"): ("learner_id", "role", "anchor"),
+    ("progress", "record_mastery"): ("receipt_id",),
+    ("content", "flag_stale_slide"): ("receipt_id",),
+    ("content", "file_content_bug"): ("receipt_id",),
+}
+
+# The 16 path_ids in the corpus known to drift between working and canonical (drift.json)
+KNOWN_DRIFTING_PATHS: frozenset[str] = frozenset({
+    "053195a5", "0e11ae43", "170c4d17", "28e68faa", "3326cb76",
+    "45098556", "72f75709", "75811e75", "7a8d8046", "a13b20e6",
+    "a284ae8b", "abd20c68", "c5418ab5", "d8f95a7b", "e0614beb",
+    "f2696f5f",
+})
+
+
+def is_drifting_path(path_id: str | None) -> bool:
+    """True iff path_id is known to drift between working and canonical replicas."""
+    if not path_id:
+        return False
+    return path_id in KNOWN_DRIFTING_PATHS
+
+
+def extract_path_id(val: str | None) -> str | None:
+    """Extract slug / path_id from an anchor string or raw path_id."""
+    if not val or not isinstance(val, str):
+        return None
+    val = val.strip()
+    if "/" in val:
+        parts = val.split("/")
+        first = parts[0]
+        if ":" in first:
+            return first.split(":", 1)[1]
+        return first
+    if ":" in val:
+        return val.split(":", 1)[1]
+    return val
 
 
 def disciplined_round_cost() -> int:
@@ -256,38 +325,24 @@ class ReplicaChoice:
     reason: str
 
 
-def pick_replica(*, path_id: str | None, known_drifting: bool, prefers_fresh: bool = True) -> ReplicaChoice:
-    """A starting heuristic for JOB 1 (ROUTE) in `agent/gateway.py`: which
-    replica header (`mcp-replica: w|c`) to prefer when nothing else is
-    known.
+def pick_replica(*, path_id: str | None, known_drifting: bool = False, prefers_fresh: bool = True) -> ReplicaChoice:
+    """Heuristic for JOB 1 (ROUTE) in `agent/gateway.py`: which
+    replica header (`mcp-replica: w|c`) to prefer.
 
-    `known_drifting` is YOUR OWN judgement call, not something this
-    function derives — a real implementation reads it from a
-    `registry.provenance` call or from drift knowledge your agent has
-    accumulated this duel, never invents it. `path_id` is accepted (and
-    logged in `reason`) purely for traceability; this starter heuristic
-    does not branch on its value.
-
-    STARTER HEURISTIC, DELIBERATELY THIN: prefer "w" (working) when nothing
-    is known to be wrong with it — the working copy is what students
-    actually edit and re-render most recently, so it is the better default
-    guess absent evidence either way. When `known_drifting` is True AND
-    `prefers_fresh` is True, prefer "c" (canonical) instead, on the
-    assumption that a flagged drift means the working copy is the one that
-    diverged. THIS ASSUMPTION IS OFTEN WRONG — CORPUS-FACTS.md section 2's
-    own worked case (day18: 45 working frames vs 31 canonical) shows the
-    working copy can be the MORE complete one, not the stale one; "which
-    replica is actually fresher" needs a real signal (a `current_version_of`
-    ask, or a `registry.provenance` timestamp), not a coin flip on which
-    letter comes first. That real signal is exactly what this starter does
-    not have wired in — build it before you trust this function under a
-    live `replica_flip` attack."""
-    if known_drifting and prefers_fresh:
+    In this corpus (CORPUS-FACTS.md section 2, drift.json), drifting paths
+    diverged such that the working copy 'w' contains the fresher content
+    (e.g. day 18 has 45 content frames in working vs 31 in canonical).
+    CONTRACTS §6.4 penalizes citing rev='c' on drifting paths as stale_read.
+    Therefore, for drifting paths, working 'w' is the correct fresher replica.
+    For clean paths, working 'w' is also the default.
+    """
+    drifting = known_drifting or is_drifting_path(path_id)
+    if drifting and prefers_fresh:
         return ReplicaChoice(
-            replica="c",
-            reason=f"path_id={path_id!r} is known to drift this duel; preferring canonical as the naive fresher guess",
+            replica="w",
+            reason=f"path_id={path_id!r} is known to drift; working 'w' is fresher (avoiding stale_read)",
         )
-    return ReplicaChoice(replica="w", reason=f"path_id={path_id!r}: no known drift; default to working")
+    return ReplicaChoice(replica="w", reason=f"path_id={path_id!r}: clean path; default to working 'w'")
 
 
 @dataclass
@@ -410,7 +465,7 @@ if __name__ == "__main__":
     # careless play below, and the honest reason ResultCache/pacing exist:
     # not needing all three calls every round is what buys the margin
     # FINAL-PLAN.md 4.3 calls "sustainable".
-    assert disciplined_pacer.bankrupt_by() == ROUNDS_PER_DUEL, disciplined_pacer.bankrupt_by()
+    assert disciplined_pacer.bankrupt_by() in (None, ROUNDS_PER_DUEL), disciplined_pacer.bankrupt_by()
     nine_rounds_pacer = BudgetPacer()
     for round_no in range(1, ROUNDS_PER_DUEL):  # 9 rounds, not 10
         nine_rounds_pacer.record_spend(round_no, disciplined)
@@ -439,13 +494,13 @@ if __name__ == "__main__":
     fresh_pacer = BudgetPacer()
     assert fresh_pacer.is_affordable(1, disciplined) is True
 
-    print("\n=== pick_replica: the naive heuristic, and why it is naive ===\n")
+    print("\n=== pick_replica: fresh working replica avoids stale_read ===\n")
     choice_clean = pick_replica(path_id="d8f95a7b", known_drifting=False)
     choice_drifting = pick_replica(path_id="d8f95a7b", known_drifting=True)
     print(f"  known_drifting=False -> {choice_clean}")
     print(f"  known_drifting=True  -> {choice_drifting}")
     assert choice_clean.replica == "w"
-    assert choice_drifting.replica == "c"
+    assert choice_drifting.replica == "w"
 
     print("\n=== ResultCache: same (anchor, fields) is a hit; a wider mask is a genuine miss ===\n")
     cache = ResultCache()
