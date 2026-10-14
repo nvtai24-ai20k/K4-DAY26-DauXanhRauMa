@@ -129,6 +129,7 @@ try:
 except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
+from agent.guardrails import scan_for_injected_instructions
 from agent.strategy import (
     A2A_SERVERS,
     DEFAULT_MASKS,
@@ -527,6 +528,15 @@ class Gateway:
             target = cmd.args.get(key)
             if target and act and str(target).strip().lower() != str(act).strip().lower():
                 return self.deny(cmd, reason=f"target {target!r} does not match ctx.act {act!r} (authority exceeded)")
+
+        # Injected instruction refusal for write commands or note arguments
+        if (server, tool) in WRITE_TOOLS:
+            for k, val in cmd.args.items():
+                if isinstance(val, str) and scan_for_injected_instructions(val).suspicious:
+                    return self.deny(cmd, reason=f"injected instruction detected in write argument {k}")
+        note_arg = cmd.args.get("note")
+        if isinstance(note_arg, str) and scan_for_injected_instructions(note_arg).suspicious:
+            return self.deny(cmd, reason="injected instruction detected in note argument")
 
         # Write commands must have target = ctx.act, If-Match and Idempotency-Key
         if (server, tool) in WRITE_TOOLS:
